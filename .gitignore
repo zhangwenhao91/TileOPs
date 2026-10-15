@@ -3,6 +3,13 @@
 *.obj
 *.pyc
 
+# An exception: the objects an out-of-tree backend serves are the artifact itself, not
+# build output, so they ship and are committed. The lowering steps that produced them are
+# not: they are regenerated from the DSL by the kernels build script beside them.
+!src/tileops/backends/ascend/artifacts/*.o
+src/tileops/backends/ascend/kernels/*.norm.mlir
+src/tileops/backends/ascend/kernels/[2345]_*
+
 # Editor files
 *~
 *.swp

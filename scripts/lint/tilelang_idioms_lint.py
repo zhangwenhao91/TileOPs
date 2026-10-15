@@ -27,7 +27,8 @@ Each rule below is a form the compiler accepts, so nothing downstream reports it
 - An environment read (``os.environ``, ``os.getenv``, or either imported from ``os``) in
   ``src/tileops/``, ``workloads/`` or ``benchmarks/``, and ``monkeypatch.setenv`` in
   ``tests/`` or ``benchmarks/``. That code takes arguments; a value read from the
-  environment reaches no cache key and no caller can see it.
+  environment reaches no cache key and no caller can see it. ``_ENV_READ_EXEMPT`` names
+  the files where the environment is the only interface, each with the reason.
 
 - An extern call (``T.call_extern``, ``T.call_pure_extern``, TVM's spelling, or any other
   call named ``call_extern`` / ``call_pure_extern``) whose target is neither a
@@ -74,6 +75,19 @@ _ENV_READ = (
     "the environment is invisible to cache keys and callers"
 )
 _SETENV = "monkeypatch.setenv configures code through the environment — pass the argument instead"
+
+# Files under _NO_ENV_READ_TREES that may read the environment anyway, each with the
+# reason the environment is the only door it has. By repository-relative path, and kept
+# to one reason per entry: the exemption is for an interface that offers nothing else,
+# not for a file that would simply rather not take the argument.
+_ENV_READ_EXEMPT = frozenset(
+    {
+        # The NPU runtime decides which precompiled object to load from the KERNEL_PATH
+        # variable and exposes no argument for it, so pointing the runtime at an object —
+        # and putting the variable back afterwards — can only be done here.
+        "src/tileops/backends/ascend/runtime/launch.py",
+    }
+)
 
 # The CUDA functions a kernel may name in T.call_extern: no T.* intrinsic emits them.
 _EXTERN_TARGETS = {
@@ -437,9 +451,17 @@ def _in_trees(path: Path, trees: tuple[tuple[str, ...], ...]) -> bool:
     return any(parts[: len(tree)] == tree for tree in trees)
 
 
+def _relative(path: Path) -> str:
+    """*path* as a repository-relative posix path; as given when it is outside the repo."""
+    try:
+        return path.resolve().relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 def _environment_uses(path: Path, tree: ast.Module) -> list[str]:
     """Environment reads, and ``monkeypatch.setenv`` calls, in the trees that refuse them."""
-    reads = _in_trees(path, _NO_ENV_READ_TREES)
+    reads = _in_trees(path, _NO_ENV_READ_TREES) and _relative(path) not in _ENV_READ_EXEMPT
     setenv = _in_trees(path, _NO_SETENV_TREES)
     # Every name this file binds to the `os` module, so an alias reads as `os` does.
     modules = {"os"} | {

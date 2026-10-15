@@ -30,6 +30,10 @@ Repository = "https://github.com/tile-ai/TileOPs"
 Documentation = "https://tile-ai.github.io/TileOPs.github.io/"
 Issues = "https://github.com/tile-ai/TileOPs/issues"
 
+[project.entry-points."tileops.backends"]
+# The value names a module; importing it registers the target. Loaded with the first op.
+ascend = "tileops.backends.ascend"
+
 [project.optional-dependencies]
 dev = [
     "ruff==0.14.13",
@@ -76,7 +80,11 @@ where = ["src"]
 # Kernel headers and YAML data are opened at run time by path relative to
 # __file__, so all of them must ship. Stated by extension, not by name, so a new
 # resource is covered on arrival. Enforced by scripts/ci/check_dist_contents.py.
-tileops = ["**/*.h", "**/*.yaml"]
+# The objects a backend serves are read the same way, by path, and are as much a
+# resource as the headers: without them an installed wheel has no kernels. The script
+# that regenerates them ships beside them, so what produced a shipped object travels
+# with it; the dist-contents check holds every tracked non-.py file to this list.
+tileops = ["**/*.h", "**/*.yaml", "**/*.o", "**/*.sh"]
 
 [tool.codespell]
 ignore-words-list = "nd, te, ist, LOD, offen, NotIn, HSA"
