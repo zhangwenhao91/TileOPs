@@ -195,5 +195,6 @@ markers = [
     "sm86: needs compute capability 8.6; skipped elsewhere, never skipped on an SM86 device",
     "sm80: needs compute capability 8.0; skipped elsewhere, never skipped on an SM80 device",
     "cuda_only: needs a CUDA device whatever the target; deselected when --tileops-device is not cuda",
+    "npu_only: needs an Ascend NPU whatever the target; deselected where torch_npu is not installed",
     "in_tree_kernels: asserts on the in-tree kernels an op built; deselected when --tileops-target is not builtin",
 ]

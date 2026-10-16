@@ -1,8 +1,8 @@
-"""What the ``ascend`` backend promises, checked anywhere.
+"""What the ``ascend`` backend promises.
 
 The two halves a target owns: routing, which the op layer drives and which is observable
-on any machine, and the object matrix, which is a table of files. Launching is not here —
-that needs an NPU, and is checked where one exists.
+on any machine, and the object matrix, which is a table of files. Launching needs an NPU,
+so it sits behind ``npu_only`` at the end and is deselected wherever there is none.
 
 Refusals are checked as carefully as the successes. A target that quietly returned
 something for a call it cannot serve would compute the wrong answer; one that raised the
@@ -177,3 +177,38 @@ def test_an_op_this_target_does_not_serve_is_refused_and_does_not_fall_back():
     """``MulFwdOp`` has in-tree kernels and no ascend one; the call must not reach them."""
     with pytest.raises(OpNotAvailableError):
         MulFwdOp(target="ascend")(torch.zeros(32, 128), torch.zeros(32, 128))
+
+
+# --------------------------------------------------------------------------------------
+# On hardware
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.npu_only
+@pytest.mark.parametrize(
+    "shape",
+    [(32, 128), (4096, 128), (64, 256)],
+    ids=["one-block", "many-blocks", "inner-256"],
+)
+def test_the_op_adds_on_an_npu(shape):
+    """Route, load the object, and agree with torch: the whole path on hardware.
+
+    Tensors go on the ``npu`` device this mark says the machine has, rather than on
+    ``run_device()``: this case needs an NPU whatever the run was pointed at, which is the
+    same carve-out ``cuda_only`` makes for CUDA.
+
+    The row count is the axis the matrix does not fix, so it is the axis worth varying:
+    one block of rows and 256 of them go through the same object, because the tile is
+    baked in and the block index is the runtime's. A second inner extent is a second
+    object, which is why it is a separate case rather than a fourth size.
+    """
+    pytest.importorskip("torch_npu")  # claims the device type named below
+
+    npu = torch.device("npu")
+    a = torch.randn(shape, dtype=torch.float32, device=npu)
+    b = torch.randn(shape, dtype=torch.float32, device=npu)
+
+    out = AddFwdOp(target="ascend")(a, b)
+
+    assert out.device == npu
+    torch.testing.assert_close(out, a + b)

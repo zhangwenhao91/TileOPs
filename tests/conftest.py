@@ -6,7 +6,7 @@ import torch
 
 from tests.workload_test_base import _check_result
 from tileops.backend import BUILTIN, default_target
-from workloads.device import run_device, run_device_is_cuda
+from workloads.device import npu_is_available, run_device, run_device_is_cuda
 
 
 def _under_repo_tests(item: pytest.Item) -> bool:
@@ -299,11 +299,13 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             "Invalid explicit test marker assignments detected:\n" + "\n".join(marker_errors)
         )
 
-    # A run on another device drops what needs CUDA; a run on another target drops what
-    # reads the in-tree kernels.
+    # A run on another device drops what needs CUDA; a machine without an NPU drops what
+    # needs one; a run on another target drops what reads the in-tree kernels.
     marks = []
     if not run_device_is_cuda():
         marks.append("cuda_only")
+    if not npu_is_available():
+        marks.append("npu_only")
     if default_target() is not BUILTIN:
         marks.append("in_tree_kernels")
     dropped = [
