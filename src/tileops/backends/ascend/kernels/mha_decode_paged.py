@@ -241,6 +241,11 @@ def compile_kernel(
         with T.Kernel(B * H) as bx:
             b: T.int32 = bx // H
             h: T.int32 = bx % H
+            # W and POOL_ROWS appear only in the shape annotations above; the
+            # annotation evaluator resolves names through the function's closure,
+            # so pin them with these (otherwise dead) TIR scalars.
+            page_width: T.int32 = W
+            pool_rows: T.int32 = POOL_ROWS
             Q_shared = T.alloc_l1((BR, D), dtype)
             K_shared = T.alloc_l1((BC, D), dtype)
             V_shared = T.alloc_l1((D, BC), dtype)
