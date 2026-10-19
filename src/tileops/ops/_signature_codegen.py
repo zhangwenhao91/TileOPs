@@ -24,7 +24,21 @@ from dataclasses import dataclass
 
 import torch
 from torch._guards import detect_fake_mode
-from torch.fx.experimental.symbolic_shapes import sym_and, sym_or
+
+try:
+    from torch.fx.experimental.symbolic_shapes import sym_and, sym_or
+except ImportError:  # torch < 2.8: only reached with symbolic (dynamic) shapes
+    def sym_and(a, b):
+        if isinstance(a, bool) and isinstance(b, bool):
+            return a and b
+        return a & b
+
+    def sym_or(a, b):
+        if isinstance(a, bool) and isinstance(b, bool):
+            return a or b
+        return a | b
+
+
 
 from tileops.backend import OpNotAvailableError
 from tileops.manifest import load_adts, try_load_entry
