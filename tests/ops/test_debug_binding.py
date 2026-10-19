@@ -5,6 +5,7 @@ Delete once the binding mystery is solved.
 """
 
 import torch
+import pytest
 
 import workloads.device as device_mod
 from tileops.backend import registry
@@ -12,6 +13,7 @@ from tileops.backend import dispatch
 from tileops.ops import MHADecodePagedWithKVCacheFwdOp
 
 
+@pytest.mark.smoke
 def test_debug_binding() -> None:
     print("\n=== in-pytest registry state ===")
     registry.ensure_loaded()
