@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 
 from tileops.backend import register_detector, register_kernel_builder
+from tileops.backends.ascend.builders.attention import build_mha_decode_paged
 from tileops.backends.ascend.builders.elementwise import build_add
 
 
@@ -29,3 +30,4 @@ register_detector("ascend", detects_ascend_npu)
 # One line per op this target serves. ``op`` is the manifest key, which is also the name
 # the op class is registered under, so the two never drift.
 register_kernel_builder("AddFwdOp", "ascend", build_add)
+register_kernel_builder("MHADecodePagedWithKVCacheFwdOp", "ascend", build_mha_decode_paged)
