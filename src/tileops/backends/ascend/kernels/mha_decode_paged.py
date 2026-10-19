@@ -52,6 +52,10 @@ def compile_kernel(
     VL = 64  # lanes one PAT_ALL vector operation reads or writes
     out_dtype = dtype
     accum_dtype = "float32"
+    # NZ 打包的转换目标与 vsstb 重解释类型：两者都是 16 位，位宽布局一致，
+    # 仅 vcvt 的目标名和最后一步 reinterpret 的向量类型名不同（example core.py 同款）。
+    pack_dtype = "bfloat16" if dtype == "bfloat16" else "float16"
+    pack_vec = pack_dtype + "x128"
     scale = dim**-0.5
 
     assert page_size % BC == 0, f"page_size must be a multiple of {BC}, got {page_size}"
@@ -74,7 +78,7 @@ def compile_kernel(
             softmax_b16 = S.pset(16, "PAT_VL128")
             dst_nz_ptr = S.make_ubuf_ptr(
                 T.access_ptr(P_nz_ub[0, 0], "w", ROWS + 1, BC),
-                "float16",
+                pack_dtype,
             )
 
             S.vsts(old_m_ub[0], S.vld(m_ub[0], "NORM"), softmax_full, "NORM_B32")
@@ -121,29 +125,29 @@ def compile_kernel(
                 S.vsts(row_sum_ub[r], row_sum0, softmax_one, "ONEPT_B32")
                 S.vsts(row_sum_ub[r + 1], row_sum1, softmax_one, "ONEPT_B32")
 
-                even_f16_0 = S.vcvt(e00, "float16", softmax_full, sat=False, part=0)
-                even_f16_1 = S.vcvt(e10, "float16", softmax_full, sat=False, part=0)
-                odd_f16_0 = S.vcvt(e01, "float16", softmax_full, sat=False, part=1)
-                odd_f16_1 = S.vcvt(e11, "float16", softmax_full, sat=False, part=1)
+                even_pk_0 = S.vcvt(e00, pack_dtype, softmax_full, sat=False, part=0)
+                even_pk_1 = S.vcvt(e10, pack_dtype, softmax_full, sat=False, part=0)
+                odd_pk_0 = S.vcvt(e01, pack_dtype, softmax_full, sat=False, part=1)
+                odd_pk_1 = S.vcvt(e11, pack_dtype, softmax_full, sat=False, part=1)
                 merged_bits0 = S.vor(
-                    T.reinterpret(even_f16_0, "uint16x128"),
-                    T.reinterpret(odd_f16_0, "uint16x128"),
+                    T.reinterpret(even_pk_0, "uint16x128"),
+                    T.reinterpret(odd_pk_0, "uint16x128"),
                     softmax_b16,
                 )
                 merged_bits1 = S.vor(
-                    T.reinterpret(even_f16_1, "uint16x128"),
-                    T.reinterpret(odd_f16_1, "uint16x128"),
+                    T.reinterpret(even_pk_1, "uint16x128"),
+                    T.reinterpret(odd_pk_1, "uint16x128"),
                     softmax_b16,
                 )
                 dst_nz_ptr = S.vsstb(
-                    T.reinterpret(merged_bits0, "float16x128"),
+                    T.reinterpret(merged_bits0, pack_vec),
                     dst_nz_ptr,
                     T.int32(((ROWS + 1) << 16) | 1),
                     softmax_b16,
                     update=True,
                 )
                 dst_nz_ptr = S.vsstb(
-                    T.reinterpret(merged_bits1, "float16x128"),
+                    T.reinterpret(merged_bits1, pack_vec),
                     dst_nz_ptr,
                     T.int32(((ROWS + 1) << 16) | 1),
                     softmax_b16,

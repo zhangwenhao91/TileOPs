@@ -29,7 +29,7 @@ from tileops.backend import OpNotAvailableError, TensorSpec
 BR = 16
 BC = 128
 
-_DTYPE_TO_STR = {torch.float16: "float16"}
+_DTYPE_TO_STR = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 
 
 def _refuse(why: str) -> OpNotAvailableError:
