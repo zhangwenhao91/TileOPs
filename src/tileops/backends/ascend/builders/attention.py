@@ -12,7 +12,9 @@ Two responsibilities live here rather than in the kernel because the kernel walk
   the cache length cuts would otherwise poison its scores and its ``P @ V`` through
   masked-but-nonzero lanes. When the read mask proves such rows exist, the builder
   zeroes every unread row of a clone; a pool every request reads in full is passed to
-  the kernel as is, skipping the pool-sized copy.
+  the kernel as is, skipping the pool-sized copy. Both the mask and the full-read
+  verdict only vary with the cache lengths and the page table, so calls sharing them
+  reuse the built mask — the full-read path then runs no mask op at all.
 * **The bias.** The kernel adds a float32 bias per query row and key tile instead of
   masking after the scale: a causal query ``i`` sees keys up to ``i + real_seqlen_kv -
   seqlen_q``, and a query that sees no key must output zeros, which the caller-side
@@ -86,29 +88,44 @@ def build_mha_decode_paged(
     # 基准循环）直接复用已构造的 fp32 张量。按 (rl 元组, 设备) 作键，超出上限整表
     # 清空防无限增长。
     bias_cache: dict[tuple, torch.Tensor] = {}
+    # read mask 与全读判定只随 (real_seqlen_kv, block_table) 变化：命中时连 mask
+    # 的约 6 个 device 算子都省掉，全读路径只剩 kernel 启动。条目为
+    # (read_mask, full_read)，全读时 mask 记 None；mask 张量构造后只读，可跨调用复用。
+    mask_cache: dict[tuple, tuple] = {}
 
     def run(q_t, k_t, v_t, rl_t, bt_t):
         """Run one decode call on the NPU, returning a fresh ``(B, S_q, H, D)`` tensor."""
         dev = q_t.device
         rl_cpu = rl_t.to("cpu", torch.int32)
-
-        # Pool rows no request reads become zeros, so a tile the cache length cuts
-        # contributes an exact zero rather than propagating whatever the pool held.
-        # The pool-sized clone is the expensive part: run it only when the mask
-        # proves at least one row is unread, and hand the untouched pools over
-        # when every request reads them in full.
-        num_pages = pool_rows // page_size
-        pos = torch.arange(max_pages_per_req * page_size, device=dev)
-        rows = bt_t[:, pos // page_size] * page_size + pos % page_size
-        read = torch.zeros(pool_rows, dtype=torch.bool, device=dev)
-        read[rows[pos[None, :] < rl_t[:, None]]] = True
-        if bool((~read).any()):
+        bt_cpu = bt_t.to("cpu", torch.int32)
+        mask_key = (tuple(rl_cpu.tolist()), tuple(bt_cpu.reshape(-1).tolist()), str(dev))
+        cached = mask_cache.get(mask_key)
+        if cached is not None:
+            read, full_read = cached
+        else:
+            if len(mask_cache) >= 8:
+                mask_cache.clear()
+            # Pool rows no request reads become zeros, so a tile the cache length cuts
+            # contributes an exact zero rather than propagating whatever the pool held.
+            # The pool-sized clone is the expensive part: run it only when the mask
+            # proves at least one row is unread, and hand the untouched pools over
+            # when every request reads them in full.
+            num_pages = pool_rows // page_size
+            pos = torch.arange(max_pages_per_req * page_size, device=dev)
+            rows = bt_t[:, pos // page_size] * page_size + pos % page_size
+            read = torch.zeros(pool_rows, dtype=torch.bool, device=dev)
+            read[rows[pos[None, :] < rl_t[:, None]]] = True
+            full_read = not bool((~read).any())
+            read = None if full_read else read
+            mask_cache[mask_key] = (read, full_read)
+        if full_read:
+            k_safe, v_safe = k_t, v_t
+        else:
+            unread = ~read
             k_safe = k_t.clone()
             v_safe = v_t.clone()
-            k_safe[~read] = 0
-            v_safe[~read] = 0
-        else:
-            k_safe, v_safe = k_t, v_t
+            k_safe[unread] = 0
+            v_safe[unread] = 0
 
         # Additive bias per query row and key tile: 0 where the key is visible,
         # -1e30 where the causal end or the cache length cuts it.
