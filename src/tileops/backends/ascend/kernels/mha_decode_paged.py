@@ -30,8 +30,14 @@ def compile_kernel(
     max_pages_per_req: int,
     pool_rows: int,
     dtype: str = "float16",
+    num_stages: int = 1,
 ):
-    """Compile the decode kernel for one shape specialization and return the JIT object."""
+    """Compile the decode kernel for one shape specialization and return the JIT object.
+
+    ``num_stages > 1`` walks the key-tile loop with ``T.Pipelined`` so the K/V/bias
+    reads of the next tile overlap the Cube/Vector compute of the current one
+    (double buffering); 1 keeps the plain serial loop.
+    """
     import tilelang
     import tilelang.ascend.language as T
     from tilelang.layout import make_ascend_compact_nz_layout
@@ -291,7 +297,10 @@ def compile_kernel(
             clear_O_ub(O_ub)
 
             rl = RL[b]
-            for kv in T.serial(NUM_KV):
+            # num_stages 是编译期 Python 常量，三元式在 DSL 展开前就选定循环形式：
+            # >1 走 T.Pipelined double-buffer，1 保持 serial。
+            for kv in (T.Pipelined(NUM_KV, num_stages=num_stages) if num_stages > 1
+                       else T.serial(NUM_KV)):
                 with T.If(kv * BC < rl):
                     with T.Then():
                         pg = kv // SP

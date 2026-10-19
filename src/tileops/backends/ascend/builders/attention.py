@@ -24,6 +24,8 @@ Two responsibilities live here rather than in the kernel because the kernel walk
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from tileops.backend import OpNotAvailableError, TensorSpec
@@ -78,10 +80,14 @@ def build_mha_decode_paged(
 
     causal = bool(is_causal)
     dtype_str = _DTYPE_TO_STR[q.dtype]
+    # kernel 循环形式的 A/B 开关：TILEOPS_MHA_NUM_STAGES>1 走 T.Pipelined
+    # double-buffer。默认 1（serial），实验口径不改变默认行为。
+    num_stages = int(os.environ.get("TILEOPS_MHA_NUM_STAGES", "1"))
     from tileops.backends.ascend.kernels.mha_decode_paged import compile_kernel
 
     kernel = compile_kernel(
-        batch, seqlen_q, heads, dim, page_size, max_pages_per_req, pool_rows, dtype_str
+        batch, seqlen_q, heads, dim, page_size, max_pages_per_req, pool_rows, dtype_str,
+        num_stages=num_stages,
     )
 
     # Bias 只随 real_seqlen_kv 变化；同缓长的重复调用（解码逐步推进前的连续请求、
