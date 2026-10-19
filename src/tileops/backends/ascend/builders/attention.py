@@ -10,12 +10,14 @@ Two responsibilities live here rather than in the kernel because the kernel walk
 
 * **Pools whose unread rows are safe.** Pool rows no request reads may hold NaN; a tile
   the cache length cuts would otherwise poison its scores and its ``P @ V`` through
-  masked-but-nonzero lanes. The builder zeroes every unread row of a clone, which keeps
-  a masked lane's contribution an exact zero.
+  masked-but-nonzero lanes. When the read mask proves such rows exist, the builder
+  zeroes every unread row of a clone; a pool every request reads in full is passed to
+  the kernel as is, skipping the pool-sized copy.
 * **The bias.** The kernel adds a float32 bias per query row and key tile instead of
   masking after the scale: a causal query ``i`` sees keys up to ``i + real_seqlen_kv -
   seqlen_q``, and a query that sees no key must output zeros, which the caller-side
-  zero of its row's finished output provides.
+  zero of its row's finished output provides. The bias only varies with the cache
+  lengths, so calls sharing ``real_seqlen_kv`` reuse the built one.
 """
 
 from __future__ import annotations
@@ -80,6 +82,11 @@ def build_mha_decode_paged(
         batch, seqlen_q, heads, dim, page_size, max_pages_per_req, pool_rows, dtype_str
     )
 
+    # Bias 只随 real_seqlen_kv 变化；同缓长的重复调用（解码逐步推进前的连续请求、
+    # 基准循环）直接复用已构造的 fp32 张量。按 (rl 元组, 设备) 作键，超出上限整表
+    # 清空防无限增长。
+    bias_cache: dict[tuple, torch.Tensor] = {}
+
     def run(q_t, k_t, v_t, rl_t, bt_t):
         """Run one decode call on the NPU, returning a fresh ``(B, S_q, H, D)`` tensor."""
         dev = q_t.device
@@ -87,30 +94,43 @@ def build_mha_decode_paged(
 
         # Pool rows no request reads become zeros, so a tile the cache length cuts
         # contributes an exact zero rather than propagating whatever the pool held.
+        # The pool-sized clone is the expensive part: run it only when the mask
+        # proves at least one row is unread, and hand the untouched pools over
+        # when every request reads them in full.
         num_pages = pool_rows // page_size
         pos = torch.arange(max_pages_per_req * page_size, device=dev)
         rows = bt_t[:, pos // page_size] * page_size + pos % page_size
         read = torch.zeros(pool_rows, dtype=torch.bool, device=dev)
         read[rows[pos[None, :] < rl_t[:, None]]] = True
-        k_safe = k_t.clone()
-        v_safe = v_t.clone()
-        k_safe[~read] = 0
-        v_safe[~read] = 0
+        if bool((~read).any()):
+            k_safe = k_t.clone()
+            v_safe = v_t.clone()
+            k_safe[~read] = 0
+            v_safe[~read] = 0
+        else:
+            k_safe, v_safe = k_t, v_t
 
         # Additive bias per query row and key tile: 0 where the key is visible,
         # -1e30 where the causal end or the cache length cuts it.
         num_kv = max_pages_per_req * (page_size // BC)
-        kv_pos = torch.arange(num_kv * BC, device=dev, dtype=torch.float32).view(1, 1, -1)
-        row_idx = torch.arange(BR, device=dev, dtype=torch.float32).view(1, BR, 1)
-        rl_f = rl_t.to(torch.float32).view(batch, 1, 1)
-        if causal:
-            last_key = row_idx + rl_f - seqlen_q
-            visible = kv_pos <= last_key
-        else:
-            visible = (kv_pos < rl_f).expand(batch, BR, num_kv * BC)
-        bias = torch.where(visible, 0.0, -1.0e30).view(batch * BR, num_kv * BC)
+        key = (tuple(rl_cpu.tolist()), str(dev))
+        bias = bias_cache.get(key)
+        if bias is None:
+            if len(bias_cache) >= 8:
+                bias_cache.clear()
+            kv_pos = torch.arange(num_kv * BC, device=dev, dtype=torch.float32).view(1, 1, -1)
+            row_idx = torch.arange(BR, device=dev, dtype=torch.float32).view(1, BR, 1)
+            rl_f = rl_t.to(torch.float32).view(batch, 1, 1)
+            if causal:
+                last_key = row_idx + rl_f - seqlen_q
+                visible = kv_pos <= last_key
+            else:
+                visible = (kv_pos < rl_f).expand(batch, BR, num_kv * BC)
+            bias = torch.where(visible, 0.0, -1.0e30).view(batch * BR, num_kv * BC)
+            bias_cache[key] = bias
 
-        o_buf = torch.zeros(
+        # The kernel's block store fills every o_buf row, so no zero fill here.
+        o_buf = torch.empty(
             batch, heads, BR, dim, dtype=q_t.dtype, device=dev
         )
         kernel(q_t, bt_t, rl_t, bias, k_safe, v_safe, o_buf)
