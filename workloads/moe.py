@@ -1,4 +1,6 @@
+import itertools
 import math
+from collections.abc import Iterable
 
 import torch
 
@@ -31,9 +33,16 @@ class FusedTopKWorkload(CallWorkload):
         gating_output, *bias = inputs
         correction_bias = bias[0] if bias else None
         p = self.call.params
-        scoring_func, renormalize = p["scoring_func"], p["renormalize"]
-        num_groups, topk_group = p["num_expert_group"], p["topk_group"]
         scale = p["routed_scaling_factor"]
+        router = _Router(
+            gating_output,
+            correction_bias,
+            p["top_k"],
+            p["scoring_func"],
+            p["renormalize"],
+            p["num_expert_group"],
+            p["topk_group"],
+        )
 
         def validate(got, expected):
             weights, ids = got[:2]
@@ -43,58 +52,15 @@ class FusedTopKWorkload(CallWorkload):
             assert ((ids >= 0) & (ids < gating_output.shape[-1])).all()
             ordered = ids.sort(-1).values
             assert (ordered[:, 1:] != ordered[:, :-1]).all(), "duplicate expert"
-            logits = gating_output.float()
-            scores = logits.softmax(-1) if scoring_func == "softmax" else logits.sigmoid()
-            selection = scores if correction_bias is None else scores + correction_bias
-            rows = torch.ones(ids.shape[0], dtype=torch.bool, device=ids.device)
-            reference_selection = selection.gather(1, ref_ids.long())
-            if num_groups > 1:
-                # A group within the slack of the last kept one may be kept in its place: such a
-                # row passes when the returned experts are the top-k of some valid group set.
-                group_scores = ref_group_scores(selection, num_groups, correction_bias is not None)
-                ranked = group_scores.sort(-1, descending=True).values
-                last = ranked[:, topk_group - 1 : topk_group]
-                slack = 1e-5 * last.abs() + 1e-6
-                allowed = group_scores >= last - slack
-                group_size = selection.shape[-1] // num_groups
-                selected_groups = ids.long() // group_size
-                assert allowed.gather(1, selected_groups).all(), "expert in dropped group"
-                if topk_group < num_groups:
-                    rows = (ranked[:, topk_group : topk_group + 1] < last - slack).squeeze(-1)
-                    forced = group_scores > last + slack
-                    forced.scatter_(1, selected_groups, True)
-                    missing = topk_group - forced.sum(-1, keepdim=True)
-                    assert (missing >= 0).all(), "experts span more groups than are kept"
-                    best = selection.view(-1, num_groups, group_size).amax(-1)
-                    candidates = allowed & ~forced
-                    # Filling with the groups of lowest best expert finds a valid set if any exists.
-                    fill_rank = (
-                        best.masked_fill(~candidates, float("inf"))
-                        .argsort(dim=-1, stable=True)
-                        .argsort(-1)
-                    )
-                    kept = forced | (candidates & (fill_rank < missing))
-                    expert_mask = kept.repeat_interleave(group_size, dim=-1)
-                    within_kept = selection.masked_fill(~expert_mask, float("-inf"))
-                    ambiguous_reference = within_kept.topk(ids.shape[1], dim=-1).values
-                    reference_selection = torch.where(
-                        rows[:, None], reference_selection, ambiguous_reference
-                    )
-            # Validate selected scores and per-expert weights independently of tie order.
-            torch.testing.assert_close(
-                selection.gather(1, ids.long()).sort(-1).values,
-                reference_selection.sort(-1).values,
-                rtol=1e-5,
-                atol=0,
-            )
-            selected = scores.gather(1, ids.long())
-            if renormalize:
+            router.assert_admissible(ids)
+            selected = router.scores.gather(1, ids.long())
+            if router.renormalize:
                 selected = selected / selected.sum(-1, keepdim=True)
             torch.testing.assert_close(weights, selected * scale, rtol=1e-4, atol=0)
 
         return Custom(
             validate,
-            "expert selection inside the kept groups and weights independent of tie order",
+            "an admissible expert selection and its weights, independent of tie order",
         )
 
 
@@ -230,29 +196,37 @@ def ref_moe_grouped_gemm(
     layout,
     out_dtype: torch.dtype | None = None,
     activation: str | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``out[rows of g] = a[rows of g] @ b[g]^T`` in fp32 per expert; other rows are zero.
+    """``out[rows of g] = a[rows of g] @ b[g]^T + bias[g]`` in fp32 per expert; other rows are
+    zero.
 
-    With ``activation``, ``b`` stacks gate and up along ``N`` and the result is
-    ``act(gate) * up``, half as wide, as the fused epilogue writes it.
+    With ``activation``, ``b`` and ``bias`` hold gate and up along ``N`` in the order the
+    activation reads (:func:`gated_activation`) and the result is the gated activation, half
+    as wide, as the fused epilogue writes it. The bias is added before the activation.
     """
     out_dtype = a.dtype if out_dtype is None else out_dtype
     num_experts, n, _ = b.shape
     out = torch.zeros(*a.shape[:-1], n, dtype=torch.float32, device=a.device)
+
+    def product(rows: torch.Tensor, g: int) -> torch.Tensor:
+        result = rows.float() @ b[g].float().T
+        return result if bias is None else result + bias[g].float()
+
     meta = layout_metadata.tolist()
     if layout.kind == "masked":
         for g, count in enumerate(meta):
-            out[g, :count] = a[g, :count].float() @ b[g].float().T
+            out[g, :count] = product(a[g, :count], g)
     elif layout.metadata_kind == "per_row":
         ids = layout_metadata.long()
         for g in range(num_experts):
             selected = ids == g
-            out[selected] = a[selected].float() @ b[g].float().T
+            out[selected] = product(a[selected], g)
     else:
         start = 0
         for g, end in enumerate(meta):
             start = -(-start // layout.alignment) * layout.alignment
-            out[start:end] = a[start:end].float() @ b[g].float().T
+            out[start:end] = product(a[start:end], g)
             start = end
     if activation is not None:
         out = gated_activation(out, activation)
@@ -263,26 +237,36 @@ class MoEGroupedGemmWorkload(CallWorkload):
     """Expert-materialized ``a``, per-expert ``b`` and the layout's generated metadata."""
 
     def gen_inputs(self) -> tuple[torch.Tensor, ...]:
-        a, b, metadata = super().gen_inputs()
+        a, b, metadata, bias = super().gen_inputs()
         # A small scale keeps fp16 accumulation over K = 7168 finite and within tolerance.
-        return a.mul_(0.02), b.mul_(0.02), metadata
+        a.mul_(0.02)
+        b.mul_(0.02)
+        activation = self.call.params["activation"]
+        if bias is not None and activation != "swigluoai":
+            # A product at std 1 stands above the 1e-1 atol beside the standard-normal bias.
+            _spread(a, b, 1.0)
+        _spread_gate_up(a, b, activation)
+        return a, b, metadata, bias
 
     def ref_program(
-        self, a: torch.Tensor, b: torch.Tensor, layout_metadata: torch.Tensor
+        self,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layout_metadata: torch.Tensor,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         p = self.call.params
         out_dtype = None if p["out_dtype"] is None else getattr(torch, p["out_dtype"])
         return ref_moe_grouped_gemm(
-            a, b, layout_metadata, p["layout"], out_dtype, activation=p["activation"]
+            a, b, layout_metadata, p["layout"], out_dtype, activation=p["activation"], bias=bias
         )
 
     def verification(self, *inputs):
         from workloads.numerics import Custom
 
-        x = inputs[0]
-        metadata = inputs[-1]
+        x, b, metadata = inputs[:3]
         mask = valid_rows(
-            self.call.params["layout"], metadata, x.numel() // x.shape[-1], inputs[1].shape[0]
+            self.call.params["layout"], metadata, x.numel() // x.shape[-1], b.shape[0]
         )
 
         def validate(got, expected):
@@ -348,11 +332,16 @@ class MoEGroupedGemmFP8Workload(CallWorkload):
 
 
 class MoEExpertMLPWorkload(CallWorkload):
-    """Expert-materialized input, stacked gate/up and down weights, generated metadata."""
+    """Expert-materialized input, gate/up and down weights, generated metadata, optional
+    biases."""
 
     def gen_inputs(self) -> tuple[torch.Tensor, ...]:
-        x, w_gate_up, w_down, metadata = super().gen_inputs()
-        return x.mul_(0.02), w_gate_up.mul_(0.02), w_down.mul_(0.02), metadata
+        x, w_gate_up, w_down, metadata, b_gate_up, b_down = super().gen_inputs()
+        x.mul_(0.02)
+        w_gate_up.mul_(0.02)
+        w_down.mul_(0.02)
+        _spread_gate_up(x, w_gate_up, self.call.params["activation"])
+        return x, w_gate_up, w_down, metadata, b_gate_up, b_down
 
     def ref_program(
         self,
@@ -360,20 +349,26 @@ class MoEExpertMLPWorkload(CallWorkload):
         w_gate_up: torch.Tensor,
         w_down: torch.Tensor,
         layout_metadata: torch.Tensor,
+        b_gate_up: torch.Tensor | None = None,
+        b_down: torch.Tensor | None = None,
     ) -> torch.Tensor:
         p = self.call.params
         activated = ref_moe_grouped_gemm(
-            expert_input, w_gate_up, layout_metadata, p["layout"], activation=p["activation"]
+            expert_input,
+            w_gate_up,
+            layout_metadata,
+            p["layout"],
+            activation=p["activation"],
+            bias=b_gate_up,
         )
-        return ref_moe_grouped_gemm(activated, w_down, layout_metadata, p["layout"])
+        return ref_moe_grouped_gemm(activated, w_down, layout_metadata, p["layout"], bias=b_down)
 
     def verification(self, *inputs):
         from workloads.numerics import Custom
 
-        x = inputs[0]
-        metadata = inputs[-1]
+        x, _, w_down, metadata = inputs[:4]
         mask = valid_rows(
-            self.call.params["layout"], metadata, x.numel() // x.shape[-1], inputs[2].shape[0]
+            self.call.params["layout"], metadata, x.numel() // x.shape[-1], w_down.shape[0]
         )
 
         def validate(got, expected):
@@ -422,13 +417,62 @@ def post_permute_verification(routed_scaling_factor=1.0):
 
 
 def gated_activation(gate_up: torch.Tensor, activation: str) -> torch.Tensor:
-    """``act(gate) * up`` over columns stacked gate then up, in the input's dtype."""
+    """The gated activation over the last axis, half as wide, in the input's dtype:
+    ``MoEGroupedGemmFwdOp``'s docstring defines each one and the order of its gate and up
+    columns. ``swigluoai`` is computed in fp32."""
+    if activation == "swigluoai":
+        # gpt-oss's fixed alpha and limit, as MoEGroupedGemmFwdOp's docstring states them.
+        alpha, limit = 1.702, 7.0
+        gate = gate_up[..., ::2].float().clamp(max=limit)
+        up = gate_up[..., 1::2].float().clamp(min=-limit, max=limit)
+        return ((up + 1) * gate * torch.sigmoid(alpha * gate)).to(gate_up.dtype)
     gate, up = gate_up.chunk(2, dim=-1)
     if activation == "silu_and_mul":
         return torch.nn.functional.silu(gate) * up
     if activation == "gelu_and_mul":
         return torch.nn.functional.gelu(gate) * up
     raise ValueError(f"unknown gated activation: {activation}")
+
+
+def _sample(rows: torch.Tensor) -> torch.Tensor:
+    """The rows a workload measures a scale on: the first 64 of *rows*, in fp32."""
+    return rows.reshape(-1, rows.shape[-1])[:64].float()
+
+
+def _spread(rows: torch.Tensor, weights: torch.Tensor, std: float) -> None:
+    """Scale *weights* in place so the product of :func:`_sample` of *rows* with expert 0's
+    weights has std *std*."""
+    weights.mul_(std / (_sample(rows) @ weights[0].float().T).std().item())
+
+
+def _spread_gate_up(rows: torch.Tensor, w_gate_up: torch.Tensor, activation: str | None) -> None:
+    """Scale ``w_gate_up`` in place so a ``swigluoai`` gate/up result, measured on expert 0 and
+    :func:`_sample` of *rows*, has std 4: swigluoai's clamp at 7 then lies 1.75 std out, so the
+    gate's upper tail and both of up's tails pass it. Any other activation keeps its scale."""
+    if activation == "swigluoai":
+        _spread(rows, w_gate_up, 4.0)
+
+
+def _scale_routed(call, rows, w_gate_up, w_down, b_gate_up=None, b_down=None) -> None:
+    """Scale a routed call's weights and standard-normal biases in place, measured on expert 0
+    and :func:`_sample` of *rows*.
+
+    Under ``swigluoai`` the gate/up result is spread as :func:`_spread_gate_up` states, and the
+    down product taken to std 0.1, where the routed verification's 1e-2 elementwise bound lies
+    above the operand-dtype rounding of the output. Each bias is scaled to half the std of the
+    product it joins, so the normalized-error bound sees a dropped or misplaced one.
+    """
+    activation = call.params.get("activation", "silu_and_mul")
+    _spread_gate_up(rows, w_gate_up, activation)
+    gate_up = _sample(rows) @ w_gate_up[0].float().T
+    if b_gate_up is not None:
+        b_gate_up.mul_(0.5 * gate_up.std().item())
+        gate_up = gate_up + b_gate_up[0].float()
+    activated = gated_activation(gate_up, activation)
+    if activation == "swigluoai":
+        _spread(activated, w_down, 0.1)
+    if b_down is not None:
+        b_down.mul_(0.5 * (activated @ w_down[0].float().T).std().item())
 
 
 def ref_routed_experts(
@@ -439,9 +483,13 @@ def ref_routed_experts(
     topk_ids: torch.Tensor,
     activation: str = "silu_and_mul",
     scale: float = 1.0,
+    *,
+    b_gate_up: torch.Tensor | None = None,
+    b_down: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``scale * sum_k w[t, k] * down(act(gate_up(h[t])))`` over each token's routed experts,
-    in fp32 per expert, cast to the hidden dtype."""
+    """``scale * sum_k w[t, k] * (down_k(act(gate_up_k(h[t]) + b_gate_up[k])) + b_down[k])``
+    over each token's routed experts, in fp32 per expert, cast to the hidden dtype; each bias
+    joins its GEMM's fp32 result, ``b_down`` before the routing weight scales it."""
     output = torch.zeros(hidden.shape, dtype=torch.float32, device=hidden.device)
     ids = topk_ids.to(torch.int64)
     for e in range(w_gate_up.shape[0]):
@@ -449,7 +497,11 @@ def ref_routed_experts(
         if t_idx.numel() == 0:
             continue
         gate_up = hidden[t_idx].float() @ w_gate_up[e].float().T
+        if b_gate_up is not None:
+            gate_up = gate_up + b_gate_up[e].float()
         down = gated_activation(gate_up, activation) @ w_down[e].float().T
+        if b_down is not None:
+            down = down + b_down[e].float()
         output.index_add_(0, t_idx, down * topk_weights[t_idx, k_idx].float().unsqueeze(-1))
     return (output * scale).to(hidden.dtype)
 
@@ -458,15 +510,20 @@ class MoEExpertsWorkload(CallWorkload):
     """Tokens, expert weights and their routing for one ``FusedMoEExpertsFwdOp`` call."""
 
     def gen_inputs(self) -> tuple[torch.Tensor, ...]:
-        output, hidden, w_gate_up, w_down, topk_weights, topk_ids = super().gen_inputs()
+        output, hidden, w_gate_up, w_down, topk_weights, topk_ids, *biases = super().gen_inputs()
         # Small scales keep fp16 accumulation over H = 7168 finite; routing weights sum to one.
+        hidden.mul_(0.1)
+        w_gate_up.mul_(0.02)
+        w_down.mul_(0.02)
+        _scale_routed(self.call, hidden, w_gate_up, w_down, *biases)
         return (
             output,
-            hidden.mul_(0.1),
-            w_gate_up.mul_(0.02),
-            w_down.mul_(0.02),
+            hidden,
+            w_gate_up,
+            w_down,
             topk_weights.softmax(dim=-1),
             topk_ids,
+            *biases,
         )
 
     def ref_program(
@@ -477,6 +534,8 @@ class MoEExpertsWorkload(CallWorkload):
         w_down: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        b_gate_up: torch.Tensor | None = None,
+        b_down: torch.Tensor | None = None,
     ) -> torch.Tensor:
         p = self.call.params
         return ref_routed_experts(
@@ -487,6 +546,8 @@ class MoEExpertsWorkload(CallWorkload):
             topk_ids,
             p.get("activation", "silu_and_mul"),
             p["routed_scaling_factor"],
+            b_gate_up=b_gate_up,
+            b_down=b_down,
         )
 
     def verification(self, *inputs):
@@ -542,6 +603,270 @@ def ref_fused_topk(
     return topk_weights, topk_ids.int()
 
 
+class _Router:
+    """The admissible routings of each token, from the float32 reference scores.
+
+    A token's routing is a set of ``topk_group`` groups and ``top_k`` experts inside them.
+    It is admissible when every group above the last kept group score by more than the
+    routing tolerance is kept and none below it by more, and when the experts' sorted
+    selection scores match, within the tolerance, the top-k inside that group set. A token
+    whose canonical routing has no score within the tolerance of its boundary admits only
+    the canonical routing.
+    """
+
+    def __init__(
+        self,
+        gating_output,
+        correction_bias,
+        top_k,
+        scoring_func,
+        renormalize,
+        num_groups,
+        topk_group,
+    ):
+        logits = gating_output.float()
+        self.scores = logits.softmax(-1) if scoring_func == "softmax" else logits.sigmoid()
+        self.selection = (
+            self.scores if correction_bias is None else self.scores + correction_bias.float()
+        )
+        self.biased = correction_bias is not None
+        self.top_k, self.renormalize = top_k, renormalize
+        self.num_groups, self.topk_group = num_groups, topk_group
+        self.canonical = ref_fused_topk(
+            gating_output,
+            correction_bias,
+            top_k,
+            scoring_func,
+            renormalize,
+            num_groups,
+            topk_group,
+        )[1].long()
+        self.ambiguous = self._ambiguous_rows()
+
+    @staticmethod
+    def _slack(score: torch.Tensor) -> torch.Tensor:
+        """The routing tolerance the op docstrings state, around *score*."""
+        # Why: the absolute term admits a float32 sigmoid's rounding where a correction bias
+        # cancels the score to near zero.
+        return 1e-5 * score.abs() + 1e-6
+
+    def _group_scores(self) -> torch.Tensor:
+        return ref_group_scores(self.selection, self.num_groups, self.biased)
+
+    def _ambiguous_rows(self) -> torch.Tensor:
+        selection = self.selection
+        rows = torch.zeros(selection.shape[0], dtype=torch.bool, device=selection.device)
+        if self.num_groups > 1 and self.topk_group < self.num_groups:
+            order = self._group_scores().sort(dim=-1, descending=True, stable=True)
+            last = order.values[:, self.topk_group - 1 : self.topk_group]
+            next_ = order.values[:, self.topk_group : self.topk_group + 1]
+            # Why twice the tolerance: this only picks the tokens to enumerate, and rounding at
+            # the band edge must not drop one the enumeration admits.
+            rows |= (next_ >= last - 2 * self._slack(last)).squeeze(-1)
+            # Expert ties count only inside the kept groups.
+            kept = torch.zeros_like(order.values, dtype=torch.bool)
+            kept.scatter_(1, order.indices[:, : self.topk_group], True)
+            mask = kept.repeat_interleave(selection.shape[-1] // self.num_groups, dim=-1)
+            selection = selection.masked_fill(~mask, float("-inf"))
+        kth = selection.gather(1, self.canonical).amin(-1, keepdim=True)
+        outside = selection.scatter(1, self.canonical, float("-inf"))
+        near = (outside >= kth - 2 * self._slack(kth)).any(-1)
+        return rows | near
+
+    def _group_sets(self, row: int) -> Iterable[tuple[int, ...]]:
+        if self.num_groups == 1 or self.topk_group >= self.num_groups:
+            return [tuple(range(self.num_groups))]
+        scores = self._group_scores()[row]
+        last = scores.sort(descending=True).values[self.topk_group - 1]
+        slack = self._slack(last)
+        always = {g for g in range(self.num_groups) if scores[g] > last + slack}
+        allowed = [g for g in range(self.num_groups) if scores[g] >= last - slack]
+        return (
+            groups
+            for groups in itertools.combinations(allowed, self.topk_group)
+            if always <= set(groups)
+        )
+
+    def _expert_sets(self, row: int, groups: tuple[int, ...], limit: int) -> list[frozenset[int]]:
+        selection = self.selection[row]
+        size = selection.numel() // self.num_groups
+        experts = torch.cat(
+            [torch.arange(g * size, (g + 1) * size, device=selection.device) for g in groups]
+        )
+        scores = selection[experts]
+        top = scores.topk(self.top_k).values.sort().values
+        kth = top[0]
+        reach = 2 * self._slack(kth)
+        forced = experts[scores > kth + reach].tolist()
+        pool = [e for e in experts[scores >= kth - reach].tolist() if e not in forced]
+        need = self.top_k - len(forced)
+        candidates = math.comb(len(pool), need)
+        if candidates > limit * self.top_k:
+            raise ValueError(f"token {row} has {candidates} candidate routings to enumerate")
+        sets = []
+        for rest in itertools.combinations(pool, need):
+            chosen = forced + list(rest)
+            if ((selection[chosen].sort().values - top).abs() <= self._slack(top)).all():
+                sets.append(frozenset(chosen))
+        return sets
+
+    def routings(self, row: int) -> list[torch.Tensor]:
+        """The admissible expert sets of token *row*, the canonical one first.
+
+        Raises:
+            ValueError: The token admits more than 64 routings, or has more candidates
+                within the tolerance than can be enumerated.
+        """
+        # Stop once the distinct-route limit is exceeded; later groups cannot shrink the set.
+        limit = 64
+        canonical = self.canonical[row]
+        if not self.ambiguous[row]:
+            return [canonical]
+        found = {frozenset(canonical.tolist())}
+        for groups in self._group_sets(row):
+            found.update(self._expert_sets(row, groups, limit))
+            if len(found) > limit:
+                raise ValueError(f"token {row} admits more than {limit} routings")
+        found.discard(frozenset(canonical.tolist()))
+        others = [torch.tensor(sorted(ids), device=canonical.device) for ids in found]
+        return [canonical, *others]
+
+    def weights(self, row: int, ids: torch.Tensor) -> torch.Tensor:
+        """The unbiased scores of *ids*, renormalized when the call renormalizes."""
+        weights = self.scores[row, ids]
+        return weights / weights.sum() if self.renormalize else weights
+
+    def assert_admissible(self, ids: torch.Tensor) -> None:
+        returned, canonical = ids.long().sort(-1).values, self.canonical.sort(-1).values
+        # Why: enumerating every near-tied token refuses one admitting too many routings even
+        # when it returns the canonical routing.
+        rows = (returned != canonical).any(-1) | self.ambiguous
+        for row in rows.nonzero().flatten().tolist():
+            admitted = {frozenset(r.tolist()) for r in self.routings(row)}
+            assert frozenset(returned[row].tolist()) in admitted, (
+                f"token {row} returns experts no admissible routing selects"
+            )
+
+
+def _routed_reference_rows(router, rows, inputs, activation, scale):
+    """For each token in *rows*, the routed output under each of its admissible routings."""
+    hidden, w_gate_up, w_down, b_gate_up, b_down = inputs
+    candidates = {}
+    for row in rows:
+        routings = router.routings(row)
+        experts = sorted({e for ids in routings for e in ids.tolist()})
+        token = hidden[row : row + 1].float()
+        outputs = {}
+        for e in experts:
+            gate_up = token @ w_gate_up[e].float().T
+            if b_gate_up is not None:
+                gate_up = gate_up + b_gate_up[e].float()
+            down = gated_activation(gate_up, activation) @ w_down[e].float().T
+            if b_down is not None:
+                down = down + b_down[e].float()
+            outputs[e] = down[0]
+        refs = []
+        for ids in routings:
+            total = torch.zeros_like(outputs[experts[0]])
+            # Expert order matches ref_routed_experts' accumulation.
+            for e, weight in sorted(
+                zip(ids.tolist(), router.weights(row, ids).tolist(), strict=True)
+            ):
+                total = total + outputs[e] * weight
+            refs.append((total * scale).to(hidden.dtype))
+        candidates[row] = refs
+    return candidates
+
+
+def _moe_close(got, expected, tol, bound):
+    """Elementwise ``atol = rtol = tol`` and normalized squared error at most *bound*."""
+    from workloads.numerics import assert_normalized_error
+
+    torch.testing.assert_close(got, expected, rtol=tol, atol=tol)
+    assert_normalized_error(got, expected, bound=bound)
+
+
+def _gate_up_swapped(gate_up_index):
+    """The reference with gate and up rows exchanged: a gate-order fault."""
+    from workloads.numerics import NegativeControl
+
+    def swapped(reference, inputs):
+        changed = list(inputs)
+        gate, up = changed[gate_up_index].chunk(2, dim=-2)
+        changed[gate_up_index] = torch.cat((up, gate), dim=-2)
+        return reference(*changed)
+
+    return NegativeControl("gate-up-swapped", swapped)
+
+
+def _admissible_reference(
+    out: torch.Tensor, refs: list[torch.Tensor], tol: float, bound: float
+) -> torch.Tensor:
+    """The reference row in *refs* that best lets *out* pass ``_moe_close(tol, bound)``.
+
+    Candidates outside the elementwise bound, or whose nonfinite values differ from *out*'s,
+    are dropped. Among the rest, the one with the smallest ``E - bound * D`` is taken, where
+    ``E`` and ``D`` are the finite elements' squared error and energy; the normalized-error
+    bound over the whole output then holds for some choice of rows exactly when it holds
+    for this one. With no candidate left, the first is returned and fails the bounds.
+    """
+    out = out.double()
+    finite = torch.isfinite(out)
+    best, best_share = refs[0], None
+    for ref in refs:
+        ref64 = ref.double()
+        if not torch.equal(finite, torch.isfinite(ref64)) or not torch.allclose(
+            out.masked_fill(finite, 0), ref64.masked_fill(finite, 0), 0, 0, equal_nan=True
+        ):
+            continue
+        a, b = out.masked_fill(~finite, 0), ref64.masked_fill(~finite, 0)
+        if ((a - b).abs() > tol + tol * b.abs()).any():
+            continue
+        share = ((a - b) ** 2).sum() - bound * (a * a + b * b).sum()
+        if best_share is None or share < best_share:
+            best, best_share = ref, share
+    return best
+
+
+def routed_verification(router, inputs, activation, scale, gate_up_index, shared=False):
+    """``moe_verification``'s bounds, against an admissible routing of each near-tied token.
+
+    The output is accepted exactly when some admissible routing of every token yields a
+    reference within the bounds.
+    """
+    from workloads.numerics import Custom
+
+    # Why: the same bounds as moe_verification; only the reference differs.
+    tol, bound = 1e-2, 1e-4
+
+    def assemble(got, expected):
+        rows = router.ambiguous.nonzero().flatten().tolist()
+        if not rows:
+            return expected
+        assembled = expected.clone()
+        for row, refs in _routed_reference_rows(router, rows, inputs, activation, scale).items():
+            assembled[row] = _admissible_reference(got[row], refs, tol, bound)
+        return assembled
+
+    def validate(got, expected):
+        if shared:
+            (got_shared, got_routed), (ref_shared, ref_routed) = got, expected
+            if ref_shared is None:
+                assert got_shared is None
+            else:
+                _moe_close(got_shared, ref_shared, tol, bound)
+            _moe_close(got_routed, assemble(got_routed, ref_routed), tol, bound)
+        else:
+            _moe_close(got, assemble(got, expected), tol, bound)
+
+    return Custom(
+        validate,
+        f"elementwise atol/rtol {tol} and normalized squared error <= {bound} under an "
+        "admissible routing of each near-tied token",
+        controls=(_gate_up_swapped(gate_up_index),),
+    )
+
+
 class FusedMoEWorkload(CallWorkload):
     """Tokens, gating logits and expert weights for one ``FusedMoEFwdOp`` call.
 
@@ -555,9 +880,16 @@ class FusedMoEWorkload(CallWorkload):
         gating = torch.randn(gating.shape, generator=g, device=gating.device)
         if bias is not None:
             bias = torch.randn(bias.shape, generator=g, device=bias.device) * 0.1
-        return (hidden.mul_(0.1), gating, w_gate_up.mul_(0.02), w_down.mul_(0.02), bias, *rest)
+        hidden.mul_(0.1)
+        w_gate_up.mul_(0.02)
+        w_down.mul_(0.02)
+        if "b_gate_up" in self.call.signature.inputs:
+            _scale_routed(self.call, hidden, w_gate_up, w_down, *rest)
+        return (hidden, gating, w_gate_up, w_down, bias, *rest)
 
-    def ref_routed(self, hidden, gating, w_gate_up, w_down, bias) -> torch.Tensor:
+    def ref_routed(
+        self, hidden, gating, w_gate_up, w_down, bias, b_gate_up=None, b_down=None
+    ) -> torch.Tensor:
         p = self.call.params
         # The routing returns unscaled weights: the experts apply the factor, once.
         weights, ids = ref_fused_topk(
@@ -570,14 +902,54 @@ class FusedMoEWorkload(CallWorkload):
             p["topk_group"],
         )
         return ref_routed_experts(
-            hidden, w_gate_up, w_down, weights, ids, p["activation"], p["routed_scaling_factor"]
+            hidden,
+            w_gate_up,
+            w_down,
+            weights,
+            ids,
+            p["activation"],
+            p["routed_scaling_factor"],
+            b_gate_up=b_gate_up,
+            b_down=b_down,
         )
 
-    def ref_program(self, hidden_states, gating_output, w_gate_up, w_down, correction_bias=None):
-        return self.ref_routed(hidden_states, gating_output, w_gate_up, w_down, correction_bias)
+    def ref_program(
+        self,
+        hidden_states,
+        gating_output,
+        w_gate_up,
+        w_down,
+        correction_bias=None,
+        b_gate_up=None,
+        b_down=None,
+    ):
+        return self.ref_routed(
+            hidden_states, gating_output, w_gate_up, w_down, correction_bias, b_gate_up, b_down
+        )
+
+    def _router(self, gating, bias):
+        p = self.call.params
+        return _Router(
+            gating,
+            bias,
+            p["top_k"],
+            p["scoring_func"],
+            p["renormalize"],
+            p["num_expert_group"],
+            p["topk_group"],
+        )
 
     def verification(self, *inputs):
-        return moe_verification(2)
+        hidden, gating, w_gate_up, w_down, bias, *rest = inputs
+        b_gate_up, b_down = (rest + [None, None])[:2]
+        p = self.call.params
+        return routed_verification(
+            self._router(gating, bias),
+            (hidden, w_gate_up, w_down, b_gate_up, b_down),
+            p["activation"],
+            p["routed_scaling_factor"],
+            gate_up_index=2,
+        )
 
 
 class FusedMoESharedExpertWorkload(FusedMoEWorkload):
@@ -610,6 +982,18 @@ class FusedMoESharedExpertWorkload(FusedMoEWorkload):
         lo, hi = p["tp_rank"] * shard, (p["tp_rank"] + 1) * shard
         gate_up = torch.cat([shared_w_gate_up[lo:hi], shared_w_gate_up[ffn + lo : ffn + hi]])
         return ref_shared_expert(hidden_states, gate_up, shared_w_down[:, lo:hi]), routed
+
+    def verification(self, *inputs):
+        hidden, gating, w_gate_up, w_down, bias, *_ = inputs
+        p = self.call.params
+        return routed_verification(
+            self._router(gating, bias),
+            (hidden, w_gate_up, w_down, None, None),
+            p["activation"],
+            p["routed_scaling_factor"],
+            gate_up_index=2,
+            shared=True,
+        )
 
 
 class SharedExpertMLPWorkload(CallWorkload):
@@ -686,9 +1070,10 @@ def ref_permute_align(
 
 
 def moe_verification(gate_up_index):
-    from workloads.numerics import Custom, NegativeControl, assert_normalized_error
-
     """Check both individual errors and scale-independent energy, including gate order."""
+    from workloads.numerics import Custom
+
+    tol, bound = 1e-2, 1e-4
 
     def validate(got, expected):
         if isinstance(expected, (tuple, list)):
@@ -697,17 +1082,10 @@ def moe_verification(gate_up_index):
         elif expected is None:
             assert got is None
         else:
-            torch.testing.assert_close(got, expected, rtol=1e-2, atol=1e-2)
-            assert_normalized_error(got, expected, bound=1e-4)
-
-    def swapped(reference, inputs):
-        changed = list(inputs)
-        gate, up = changed[gate_up_index].chunk(2, dim=-2)
-        changed[gate_up_index] = torch.cat((up, gate), dim=-2)
-        return reference(*changed)
+            _moe_close(got, expected, tol, bound)
 
     return Custom(
         validate,
-        "elementwise atol/rtol 1e-2 and normalized squared error <= 1e-4",
-        controls=(NegativeControl("gate-up-swapped", swapped),),
+        f"elementwise atol/rtol {tol} and normalized squared error <= {bound}",
+        controls=(_gate_up_swapped(gate_up_index),),
     )

@@ -15,6 +15,7 @@ from tileops.kernels.moe import (
     MGroupedGemmFP8Call,
     MGroupedGemmFP8FwdInterface,
     MoEGroupedGemmFP8Kernel,
+    MoEGroupedGemmFP8MMAKernel,
 )
 from tileops.ops.moe.contracts import MaskedLayoutSpec
 from tileops.ops.op_base import Op
@@ -42,12 +43,13 @@ class MoEGroupedGemmFP8FwdOp(Op):
     operands under their scales to ``atol = 2e-2 * sqrt(max(1, K / 1024))`` and
     ``rtol = 2e-2`` (``workloads.gemm.fp8_matmul_verification``), a bound that grows with
     ``K`` as the fp8 accumulation noise does. The scales are applied in DeepGEMM's order;
-    on the manifest's E = 8 rows the output is bit-identical to
+    on SM90, the TMA implementation's manifest E = 8 outputs are bit-identical to
     ``deep_gemm.m_grouped_fp8_gemm_nt_masked``.
     """
 
     kernel_types: ClassVar[Mapping[str, type[Kernel]]] = {
-        "grouped_gemm_fp8": MoEGroupedGemmFP8Kernel
+        "grouped_gemm_fp8": MoEGroupedGemmFP8Kernel,
+        "grouped_gemm_fp8_mma": MoEGroupedGemmFP8MMAKernel,
     }
     interfaces: ClassVar[Mapping[str, type[KernelInterface]]] = {
         "grouped_gemm_fp8": MGroupedGemmFP8FwdInterface
@@ -104,7 +106,8 @@ class MoEGroupedGemmFP8FwdOp(Op):
             b_scale: ``float32`` per-block scales of ``b``, ``[E, N / 128, K / 128]``.
             layout_metadata: ``int32`` valid row count of each expert, ``[E]``.
             out: Optional preallocated contiguous ``bfloat16`` output, ``[E, max_m, N]``,
-                written in place and returned; ``None`` allocates one.
+                written in place and returned; ``None`` allocates one. Must not overlap any
+                input, or a ``ValueError`` is raised before writing.
 
         Returns:
             ``[E, max_m, N]`` in ``bfloat16``; rows at or past ``layout_metadata[g]`` are

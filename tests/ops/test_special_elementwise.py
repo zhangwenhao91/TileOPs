@@ -229,6 +229,27 @@ def test_nan_to_num(n_total: int, dtype: torch.dtype) -> None:
     )
 
 
+@pytest.mark.smoke
+def test_nan_to_num_tuned_ragged() -> None:
+    """Tuned, on a bfloat16 run whose last block and last vector are partial."""
+    from tileops.ops.elementwise import NanToNumFwdOp
+
+    n_total = 1_048_576 + 1003
+    x = torch.randn(n_total, device=run_device(), dtype=torch.bfloat16)
+    x[::7] = float("nan")
+    x[1::7] = float("inf")
+    x[2::7] = float("-inf")
+    op = NanToNumFwdOp(nan=0.0, posinf=1e4, neginf=-1e4)
+    op.request_tune()
+    compare_outputs(
+        op(x),
+        torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4),
+        ElementwiseWorkload(
+            type(op).__name__, (x,), nan=0.0, posinf=10000.0, neginf=-10000.0
+        ).verification(*(x,)),
+    )
+
+
 # --- L1: alibi ---
 
 
@@ -612,14 +633,17 @@ def test_scalar_param_rejects_unrepresentable(make_op) -> None:
         call(fp16)
 
 
-@pytest.mark.cuda_only
+@pytest.mark.skipif(
+    torch.device(run_device()).type == "cpu",
+    reason="mixes a run-device tensor with a cpu one, so the run device is not cpu",
+)
 @pytest.mark.smoke
 def test_masked_fill_forward_rejects_cpu_mask() -> None:
-    """MaskedFillTensorFwdOp forward() must raise ValueError when mask is not on CUDA."""
+    """MaskedFillTensorFwdOp forward() must raise ValueError when mask is not on x's device."""
     from tileops.ops.elementwise import MaskedFillScalarFwdOp
 
     op = MaskedFillScalarFwdOp(value=-100.0)
-    x = torch.randn(1024, device="cuda", dtype=torch.float16)
+    x = torch.randn(1024, device=run_device(), dtype=torch.float16)
     mask = torch.ones(1024, dtype=torch.bool)  # CPU mask
     with pytest.raises(ValueError, match="needs every tensor on one device"):
         op(x, mask)

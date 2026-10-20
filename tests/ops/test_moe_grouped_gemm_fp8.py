@@ -61,7 +61,9 @@ def _run_into_guarded_out(op, workload: MoEGroupedGemmFP8Workload, *inputs) -> t
 _ROWS = {row["label"]: row for row in load_workloads(_OP)}
 
 
-@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "arch", [pytest.param(89, marks=pytest.mark.sm89), pytest.param(90, marks=pytest.mark.sm90)]
+)
 @pytest.mark.parametrize(
     "label",
     [
@@ -74,7 +76,7 @@ _ROWS = {row["label"]: row for row in load_workloads(_OP)}
         pytest.param("kimi-k2-dec-b64-down", marks=pytest.mark.full),
     ],
 )
-def test_fp8_grouped_gemm_runs_the_manifest_rows(label: str) -> None:
+def test_fp8_grouped_gemm_runs_the_manifest_rows(label: str, arch: int) -> None:
     """Representative manifest rows, with their generated valid counts, match the reference."""
     row = {key: value for key, value in _ROWS[label].items() if key != "label"}
     workload = MoEGroupedGemmFP8Workload(manifest_call(_OP, **row))
@@ -84,7 +86,9 @@ def test_fp8_grouped_gemm_runs_the_manifest_rows(label: str) -> None:
     compare_outputs(out, workload.ref_program(*inputs), workload.verification(*inputs))
 
 
-@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "arch", [pytest.param(89, marks=pytest.mark.sm89), pytest.param(90, marks=pytest.mark.sm90)]
+)
 @pytest.mark.smoke
 @pytest.mark.parametrize(
     ("max_m", "dims", "counts"),
@@ -112,7 +116,7 @@ def test_fp8_grouped_gemm_runs_the_manifest_rows(label: str) -> None:
     ],
 )
 def test_fp8_grouped_gemm_valid_rows_at_tile_and_slab_boundaries(
-    max_m: int, dims: dict, counts: list
+    max_m: int, dims: dict, counts: list, arch: int
 ) -> None:
     dims = {"N": 256, "K": 512, **dims}
     workload = _workload(max_m, E=len(counts), **dims)
@@ -220,9 +224,11 @@ def test_fp8_grouped_gemm_config_refusal_covers_the_builder_domain() -> None:
         assert kernel.config_refusal(config, sm_count=sm_count, smem_limit=smem_limit) is None
 
 
-@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "arch", [pytest.param(89, marks=pytest.mark.sm89), pytest.param(90, marks=pytest.mark.sm90)]
+)
 @pytest.mark.smoke
-def test_fp8_grouped_gemm_tune_picks_a_correct_config() -> None:
+def test_fp8_grouped_gemm_tune_picks_a_correct_config(arch: int) -> None:
     """Feature: ``request_tune()`` sweeps the candidates; the chosen one still matches the
     reference."""
     workload = _workload(128, E=4, N=256, K=512)
@@ -238,9 +244,11 @@ def test_fp8_grouped_gemm_tune_picks_a_correct_config() -> None:
     compare_outputs(out, workload.ref_program(*inputs), workload.verification(*inputs))
 
 
-@pytest.mark.sm90
+@pytest.mark.parametrize(
+    "arch", [pytest.param(89, marks=pytest.mark.sm89), pytest.param(90, marks=pytest.mark.sm90)]
+)
 @pytest.mark.smoke
-def test_fp8_grouped_gemm_rejects_another_fp8_format() -> None:
+def test_fp8_grouped_gemm_rejects_another_fp8_format(arch: int) -> None:
     """Dtype: the signature takes only e4m3 operands; an e5m2 ``a`` is refused before any
     kernel."""
     workload = _workload(64, E=2, N=128, K=128)
@@ -287,3 +295,50 @@ def test_fp8_grouped_gemm_kernel_refuses_what_it_cannot_run(facts: dict, reason:
     op = MoEGroupedGemmFP8FwdOp(MaskedLayoutSpec(max_m=64))
     with pytest.raises(ValueError, match=reason):
         op.key_for(_KEY, _fp8_call(**facts))
+
+
+def _fp8_in_workspace(name, overlap):
+    max_m, experts, n, k = 64, 2, 128, 128
+    workload = _workload(max_m, E=experts, N=n, K=k)
+    names = ("a", "a_scale", "b", "b_scale", "layout_metadata")
+    inputs = dict(zip(names, _with_counts(workload, [max_m] * experts), strict=True))
+    source = inputs[name]
+    out_like = torch.empty(experts, max_m, n, dtype=torch.bfloat16)
+    workspace = torch.zeros(
+        out_like.nbytes + source.nbytes, dtype=torch.uint8, device=source.device
+    )
+    start = out_like.nbytes - (source.element_size() if overlap else 0)
+    inputs[name] = torch.from_dlpack(
+        workspace[start : start + source.nbytes].view(source.dtype).view(source.shape).copy_(source)
+    )
+    out = torch.from_dlpack(workspace[: out_like.nbytes].view(out_like.dtype).view(out_like.shape))
+    return MoEGroupedGemmFP8FwdOp(**workload.call.arguments({})), inputs, out, workload, workspace
+
+
+@pytest.mark.parametrize(
+    "arch", [pytest.param(89, marks=pytest.mark.sm89), pytest.param(90, marks=pytest.mark.sm90)]
+)
+@pytest.mark.smoke
+@pytest.mark.parametrize("name", ["a", "a_scale", "b", "b_scale", "layout_metadata"])
+def test_fp8_refuses_overlapping_dlpack_output(name, arch: int):
+    """An output sharing an element with any input is refused without writing."""
+    op, inputs, out, _, workspace = _fp8_in_workspace(name, True)
+    before = workspace.clone()
+    with pytest.raises(ValueError, match=f"out must not overlap {name}"):
+        op(**inputs, out=out)
+    assert torch.equal(workspace, before)
+
+
+@pytest.mark.parametrize(
+    "arch", [pytest.param(89, marks=pytest.mark.sm89), pytest.param(90, marks=pytest.mark.sm90)]
+)
+@pytest.mark.smoke
+@pytest.mark.parametrize("name", ["a", "a_scale", "b", "b_scale", "layout_metadata"])
+def test_fp8_accepts_adjacent_dlpack_output(name, arch: int):
+    """An output ending where an input starts is written without modifying that input."""
+    op, inputs, out, workload, workspace = _fp8_in_workspace(name, False)
+    before = workspace.clone()
+    assert op(**inputs, out=out) is out
+    args = tuple(inputs.values())
+    compare_outputs(out, workload.ref_program(*args), workload.verification(*args))
+    assert torch.equal(workspace[out.nbytes :], before[out.nbytes :])

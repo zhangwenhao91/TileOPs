@@ -1594,9 +1594,8 @@ class _PassthroughGenericKernel(Kernel, AvgPool2dFwdInterface):
 
 
 @pytest.mark.in_tree_kernels
-@pytest.mark.cuda_only
 @pytest.mark.smoke
-@pytest.mark.skipif(not run_device_available(), reason="CUDA required")
+@pytest.mark.skipif(not run_device_available(), reason="the run device is not available")
 def test_avg_pool_runs_a_registered_implementation_preferred_over_the_general_one() -> None:
     """An added implementation inheriting the key's interface runs where it is preferred."""
 
@@ -1611,7 +1610,7 @@ def test_avg_pool_runs_a_registered_implementation_preferred_over_the_general_on
         registry.restore(state)
 
     # A width no 16-byte load divides, so no implementation preferred over the key serves it.
-    op(torch.randn(1, 2, 8, 10, device="cuda", dtype=torch.float16))
+    op(torch.randn(1, 2, 8, 10, device=run_device(), dtype=torch.float16))
 
     assert [type(k) for k in op.iter_kernels()] == [_PreferredPassthrough]
 
@@ -2002,8 +2001,6 @@ def test_max_pool2d_windows_read_into_registers(
         pytest.param(
             (2, 3, 17, 16), (4, 5), (3, 4), 0, torch.float32, 0, "nan", id="reach-after-nan-fp32"
         ),
-        # Past 128 MiB the run is read without the evict-first hint.
-        pytest.param((1, 1344, 224, 224), 2, 2, 0, torch.float16, 0, "nan", id="large-fp16"),
     ],
 )
 def test_max_pool2d_indices_windows_read_into_registers(

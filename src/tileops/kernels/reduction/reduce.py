@@ -137,7 +137,7 @@ class ReduceKernelBase(Kernel):
         Raises:
             ValueError: *x* is not on a CUDA device.
         """
-        self._require_cuda(x=x)
+        self._require_devices(x=x)
         x = vector_aligned(x)
         in_shape = tuple(x.shape)
         result = self._reduce(x)
@@ -235,6 +235,15 @@ class ReduceFoldKernel(
 
     @property
     def default_config(self) -> dict:
+        """512 threads where each still folds at least four vectors of the row, else the default.
+
+        A wider block puts more of a long row in flight; on a short row it leaves each
+        thread a vector or two, and the block's final reduction dominates.
+        """
+        wide_threads, min_vectors_per_thread = 512, 4
+        vectors = self.N * torch_dtype_nbytes(self.dtype) // VECTOR_ACCESS_BYTES
+        if vectors >= wide_threads * min_vectors_per_thread:
+            return {"threads": wide_threads}
         return {"threads": DEFAULT_THREADS}
 
     @property

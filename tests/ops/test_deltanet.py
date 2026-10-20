@@ -57,6 +57,8 @@ class DeltaNetChunkFwdFixture(FixtureBase):
                 pytest.param(1, 128, 4, 64, 64, 32, torch.bfloat16, False, marks=pytest.mark.full),
                 pytest.param(2, 8192, 4, 64, 64, 64, torch.float16, False, marks=pytest.mark.full),
                 pytest.param(2, 16384, 4, 64, 64, 64, torch.float16, False, marks=pytest.mark.full),
+                # State walk with dim_v > dim_k: the late-load branches.
+                pytest.param(1, 256, 2, 64, 128, 128, torch.float32, False, marks=pytest.mark.full),
                 # chunk_size=64 is where the untuned default takes a tiled width, so
                 # the tuned run has to beat a tiled baseline rather than no tiling.
                 pytest.param(
@@ -128,6 +130,8 @@ class DeltaNetChunkBwdFixture(FixtureBase):
                 pytest.param(1, 128, 4, 64, 64, 32, torch.float32, False, marks=pytest.mark.full),
                 pytest.param(1, 128, 4, 64, 64, 32, torch.float16, False, marks=pytest.mark.full),
                 pytest.param(1, 128, 4, 64, 64, 32, torch.bfloat16, False, marks=pytest.mark.full),
+                # Backward from the state walk's saved S, w and u.
+                pytest.param(1, 256, 2, 64, 64, 64, torch.bfloat16, False, marks=pytest.mark.full),
                 pytest.param(
                     2,
                     64,
@@ -264,7 +268,6 @@ def test_deltanet_fwd_reaches_target_with_optional_inputs() -> None:
 
 @pytest.mark.smoke
 @pytest.mark.usefixtures("isolated_registry")
-@pytest.mark.cuda_only
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 @PREFILL_ARCHITECTURES
 def test_deltanet_dense_prefill_matches_fla(_architecture: int, dtype: torch.dtype) -> None:
@@ -281,7 +284,6 @@ def test_deltanet_dense_prefill_matches_fla(_architecture: int, dtype: torch.dty
 
 
 @pytest.mark.smoke
-@pytest.mark.cuda_only
 @PREFILL_ARCHITECTURES
 def test_deltanet_dense_prefill_normalizes_q_and_k(_architecture: int) -> None:
     """``use_qk_l2norm_in_kernel`` takes Q and K unnormalized and matches FLA."""
@@ -292,7 +294,6 @@ def test_deltanet_dense_prefill_normalizes_q_and_k(_architecture: int) -> None:
 
 
 @pytest.mark.smoke
-@pytest.mark.cuda_only
 @PREFILL_ARCHITECTURES
 def test_deltanet_prefill_packs_ragged_sequences(_architecture: int) -> None:
     """Lengths below, across and on a chunk boundary in one packed call."""
@@ -302,7 +303,6 @@ def test_deltanet_prefill_packs_ragged_sequences(_architecture: int) -> None:
 
 
 @pytest.mark.smoke
-@pytest.mark.cuda_only
 @PREFILL_ARCHITECTURES
 def test_deltanet_prefill_runs_a_row_that_is_not_a_whole_chunk(_architecture: int) -> None:
     torch.manual_seed(42)
@@ -310,9 +310,9 @@ def test_deltanet_prefill_runs_a_row_that_is_not_a_whole_chunk(_architecture: in
     test.check(DeltaNetFwdOp(), *test.gen_inputs())
 
 
+@pytest.mark.in_tree_kernels
 @pytest.mark.smoke
 @pytest.mark.sm90
-@pytest.mark.cuda_only
 def test_deltanet_partitioned_prefill_matches_fla() -> None:
     torch.manual_seed(2163)
     test = DeltaNetFwdTest(2, 512, 4, 64, torch.bfloat16)
@@ -338,7 +338,6 @@ def test_deltanet_decode_matches_fla(dtype: torch.dtype) -> None:
 
 @pytest.mark.smoke
 @pytest.mark.sm90
-@pytest.mark.cuda_only
 def test_deltanet_wide_partitioned_prefill_matches_fla() -> None:
     torch.manual_seed(2163)
     test = DeltaNetFwdTest(2, 1024, 4, 128, torch.bfloat16)
@@ -348,7 +347,6 @@ def test_deltanet_wide_partitioned_prefill_matches_fla() -> None:
 
 @pytest.mark.smoke
 @pytest.mark.usefixtures("isolated_registry")
-@pytest.mark.cuda_only
 @PREFILL_ARCHITECTURES
 def test_deltanet_wide_prefill_matches_fla(_architecture: int) -> None:
     torch.manual_seed(2163)
@@ -433,8 +431,8 @@ def test_deltanet_decode_multi_step(
         compare_outputs(state_op, state_ref, decode_verification(dtype))
 
 
+@pytest.mark.in_tree_kernels
 @pytest.mark.sm90
-@pytest.mark.cuda_only
 @pytest.mark.smoke
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_deltanet_decode_raw_cuda_real_128x128_smoke(dtype: torch.dtype) -> None:
@@ -448,8 +446,8 @@ def test_deltanet_decode_raw_cuda_real_128x128_smoke(dtype: torch.dtype) -> None
     test.check(op, *inputs)
 
 
+@pytest.mark.in_tree_kernels
 @pytest.mark.sm90
-@pytest.mark.cuda_only
 @pytest.mark.smoke
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_deltanet_decode_raw_cuda_real_128x128_multi_step_smoke(
