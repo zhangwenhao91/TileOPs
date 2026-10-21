@@ -53,8 +53,8 @@ def _refuse(why: str) -> OpNotAvailableError:
 def _refuse_mla(why: str) -> OpNotAvailableError:
     """The error for an ``MLADecodeWithKVCacheFwdOp`` call this target has no kernel for."""
     served = (
-        f"float16 or bfloat16, one KV head (MQA), heads a multiple of 64, dim a "
-        f"multiple of 128, pe_dim a multiple of 16, seqlen_kv a multiple of {BC}"
+        f"float16 or bfloat16, one KV head (MQA), heads a multiple of 16, dim a "
+        f"multiple of 128, pe_dim a multiple of 16, seqlen_kv a positive multiple of {BC}"
     )
     return OpNotAvailableError(
         f"the ascend target serves MLADecodeWithKVCacheFwdOp for {served}; "
@@ -204,14 +204,16 @@ def build_mla_decode(
         raise _refuse_mla("one element type across Q/Q_pe/K/K_pe")
     if heads_kv != 1:
         raise _refuse_mla(f"one KV head (got {heads_kv})")
-    if heads % 64:
-        raise _refuse_mla(f"heads a multiple of 64 (got {heads})")
+    if heads % 16:
+        raise _refuse_mla(f"heads a multiple of 16 (got {heads})")
     if dim % 128:
         raise _refuse_mla(f"dim a multiple of 128 (got {dim})")
     if pe_dim % 16:
         raise _refuse_mla(f"pe_dim a multiple of 16 (got {pe_dim})")
-    if seqlen_kv % BC:
-        raise _refuse_mla(f"seqlen_kv a multiple of {BC} (got {seqlen_kv})")
+    # A cache shorter than one key tile (or empty) has no unmasked serving path yet:
+    # padded keys would pollute the softmax and an empty cache divides 0/0.
+    if seqlen_kv < BC or seqlen_kv % BC:
+        raise _refuse_mla(f"seqlen_kv a positive multiple of {BC} (got {seqlen_kv})")
 
     dtype_str = _DTYPE_TO_STR[q.dtype]
     from tileops.backends.ascend.kernels.mla_decode import compile_kernel
