@@ -293,4 +293,4 @@ def compile_kernel(
             for fb in list(range(NT)):
                 finalize_tile(O, b_idx, hb, fb, o_slots[fb], O_cast_ub, l_bufs[fb])
 
-    return mla_decode
+    return tilelang.compile(mla_decode)
