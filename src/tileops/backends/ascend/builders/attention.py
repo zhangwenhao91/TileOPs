@@ -50,6 +50,18 @@ def _refuse(why: str) -> OpNotAvailableError:
     )
 
 
+def _refuse_mla(why: str) -> OpNotAvailableError:
+    """The error for an ``MLADecodeWithKVCacheFwdOp`` call this target has no kernel for."""
+    served = (
+        f"float16 or bfloat16, one KV head (MQA), heads a multiple of 64, dim a "
+        f"multiple of 128, pe_dim a multiple of 16, seqlen_kv a multiple of {BC}"
+    )
+    return OpNotAvailableError(
+        f"the ascend target serves MLADecodeWithKVCacheFwdOp for {served}; "
+        f"this call asks for {why}. No in-tree kernel runs on an NPU to fall back to."
+    )
+
+
 def build_mha_decode_paged(
     q: TensorSpec,
     k: TensorSpec,
@@ -165,5 +177,56 @@ def build_mha_decode_paged(
             no_key = (q_rows[None, :] + rl_t[:, None] - seqlen_q) < 0
             out[no_key] = 0
         return out
+
+    return run
+
+
+def build_mla_decode(
+    q: TensorSpec,
+    q_pe: TensorSpec,
+    k: TensorSpec,
+    k_pe: TensorSpec,
+):
+    """Return the kernel serving one MLA decode call shape on the NPU.
+
+    Weights are absorbed — the value pool is the nope half of ``K`` — so unlike the
+    paged MHA builder there is no page table to sanitize, no bias to build and no
+    rows to zero: every input is dense and fully read. One compile per shape; the op
+    layer's per-signature cache keeps it to that.
+    """
+    batch, heads, dim = q.shape
+    pe_dim = q_pe.shape[2]
+    seqlen_kv, heads_kv = k.shape[1], k.shape[2]
+
+    if q.dtype not in _DTYPE_TO_STR:
+        raise _refuse_mla(f"Q dtype {q.dtype}")
+    if q_pe.dtype != q.dtype or k.dtype != q.dtype or k_pe.dtype != q.dtype:
+        raise _refuse_mla("one element type across Q/Q_pe/K/K_pe")
+    if heads_kv != 1:
+        raise _refuse_mla(f"one KV head (got {heads_kv})")
+    if heads % 64:
+        raise _refuse_mla(f"heads a multiple of 64 (got {heads})")
+    if dim % 128:
+        raise _refuse_mla(f"dim a multiple of 128 (got {dim})")
+    if pe_dim % 16:
+        raise _refuse_mla(f"pe_dim a multiple of 16 (got {pe_dim})")
+    if seqlen_kv % BC:
+        raise _refuse_mla(f"seqlen_kv a multiple of {BC} (got {seqlen_kv})")
+
+    dtype_str = _DTYPE_TO_STR[q.dtype]
+    from tileops.backends.ascend.kernels.mla_decode import compile_kernel
+
+    kernel = compile_kernel(batch, heads, dim, pe_dim, seqlen_kv, dtype_str)
+    head_blocks = heads // min(128, heads)
+
+    def run(q_t, q_pe_t, k_t, k_pe_t):
+        """Run one MLA decode call on the NPU, returning a fresh ``(B, H, D)`` tensor."""
+        o_buf = torch.empty(
+            batch, head_blocks, min(128, heads), dim, dtype=q_t.dtype, device=q_t.device
+        )
+        # The kernel writes every head slot, so the flat view is the contract's
+        # ``(B, H, D)`` output with heads in order — no permute or zero fill needed.
+        kernel(q_t, q_pe_t, k_t, k_pe_t, o_buf)
+        return o_buf.view(batch, heads, dim)
 
     return run
